@@ -218,7 +218,7 @@ class DAGNode(DAGNodeBase):
             new_args, new_kwargs, self.get_options(), new_other_args_to_resolve
         )
 
-    def apply_recursive(self, fn: "Callable[[DAGNode], T]") -> T:
+    def apply_recursive(self, fn: "Callable[[DAGNode], T]", _cache: Dict = None) -> T:
         """Apply callable on each node in this DAG in a bottom-up tree walk.
 
         Args:
@@ -230,31 +230,56 @@ class DAGNode(DAGNodeBase):
             Return type of the fn after application to the tree.
         """
 
-        class _CachingFn:
-            def __init__(self, fn):
-                self.cache = {}
-                self.fn = fn
-                self.fn.cache = self.cache
-                self.input_node_uuid = None
+        if _cache is None:
+            _cache = {}
 
-            def __call__(self, node):
-                if node._stable_uuid not in self.cache:
-                    self.cache[node._stable_uuid] = self.fn(node)
-                if type(node).__name__ == "InputNode":
-                    if not self.input_node_uuid:
-                        self.input_node_uuid = node._stable_uuid
-                    elif self.input_node_uuid != node._stable_uuid:
-                        raise AssertionError(
-                            "Each DAG should only have one unique InputNode."
-                        )
-                return self.cache[node._stable_uuid]
+        if type(self).__name__ == "InputNode":
+            if "input" in _cache:
+                raise AssertionError("Each DAG should only have one unique InputNode.")
+        if self._stable_uuid in _cache:
+            return _cache[self._stable_uuid]
 
-        if not type(fn).__name__ == "_CachingFn":
-            fn = _CachingFn(fn)
+        replace_table = {}
+        # CloudPickler scanner object for current layer of DAGNode. Same
+        # scanner should be use for a full find & replace cycle.
+        scanner = _PyObjScanner()
 
+        # Find all first-level nested DAGNode children in args.
+        # Update replacement table and execute the replace.
+        for node in scanner.find_nodes(
+            [
+                self._bound_args,
+                self._bound_kwargs,
+                self._bound_other_args_to_resolve,
+            ]
+        ):
+            if node not in replace_table:
+                replace_table[node] = node.apply_recursive(fn, _cache)
+        (
+            new_args,
+            new_kwargs,
+            new_other_args_to_resolve,
+        ) = scanner.replace_nodes(replace_table)
+
+        # Return updated copy of self.
+        new_node = self._copy(
+            new_args,
+            new_kwargs,
+            self.get_options(),
+            new_other_args_to_resolve,
+        )
+
+        output = fn(new_node)
+        if type(self).__name__ == "InputNode":
+            _cache["input"] = output
+        else:
+            _cache[self._stable_uuid] = output
+        return output
+
+    def _apply_recursive(self, fn: "Callable[[DAGNode], T]") -> T:
         return fn(
             self._apply_and_replace_all_child_nodes(
-                lambda node: node.apply_recursive(fn)
+                lambda node: node._apply_recursive(fn)
             )
         )
 
